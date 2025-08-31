@@ -21,14 +21,17 @@ FetchContent_MakeAvailable(md_prsr)
 add_library(order_book
         src/order_book.cpp
         src/order_book.h
+        src/itch_router.h
 )
 
-add_executable(main src/main.cpp)
+add_executable(main src/main.cpp src/order_book.cpp)
 target_link_libraries(main
         PRIVATE md_prsr::nasdaq_itch_v5_0)
 
 target_link_libraries(order_book
         PRIVATE md_prsr::nasdaq_itch_v5_0)
+
+
 target_include_directories(order_book PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src>)
 

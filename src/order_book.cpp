@@ -1,9 +1,11 @@
 #include "order_book.h"
+#include <chrono>
+#include <numeric>
 
 namespace trading {
-    static std::uint64_t now_us() {
+    static ts_ns_t now_ns() {
         using namespace std::chrono;
-        return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+        return duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
     }
 
     std::vector<Trade> OrderBook::add_order(const Order &order) {
@@ -15,10 +17,11 @@ namespace trading {
 
         if (order.side == Side::Bid) {
             bool cross = !asks_.empty() && asks_.begin()->first <= order.price;
-            uint32_t rest = order.quantity;
+            qty_t rest = order.quantity;
+
             if (cross) {
                 for (auto it = asks_.begin(); it != asks_.end() && rest > 0;) {
-                    auto &[price, fifo] = it->second;
+                    auto &[price, fifo] = it->second; // PriceLevel (price4_t, deque<Order>)
 
                     while (!fifo.empty()) {
                         if (fifo.front().quantity < rest) {
@@ -30,7 +33,7 @@ namespace trading {
                                 order.side,
                                 fifo.front().price,
                                 fifo.front().quantity,
-                                now_us()
+                                now_ns()
                             };
                             trades.push_back(tr);
                             index_.erase(fifo.front().id);
@@ -44,7 +47,7 @@ namespace trading {
                                 order.side,
                                 fifo.front().price,
                                 rest,
-                                now_us()
+                                now_ns()
                             };
                             trades.push_back(tr);
                             rest = 0;
@@ -55,26 +58,30 @@ namespace trading {
                             break;
                         }
                     }
+
                     if (fifo.empty()) {
                         it = asks_.erase(it);
                     } else {
                         ++it;
                     }
+
                     if (rest == 0) {
                         return trades;
                     }
                 }
             }
+
             auto [lvlIt, _] = bids_.try_emplace(order.price, PriceLevel{order.price});
-            lvlIt->second.fifo.emplace_back(order.id, Side::Bid, order.price, rest, order.timestamp);
+            lvlIt->second.fifo.emplace_back(Order{order.id, Side::Bid, order.price, rest, order.timestamp});
             const auto &fifo = lvlIt->second.fifo;
             const std::size_t offset = fifo.size() - 1;
-            index_[order.id] = {order.side, order.price, offset};
+            index_[order.id] = {order.side, rest, order.price, offset};
         }
 
         if (order.side == Side::Ask) {
             bool cross = !bids_.empty() && bids_.begin()->first >= order.price;
-            uint32_t rest = order.quantity;
+            qty_t rest = order.quantity;
+
             if (cross) {
                 for (auto it = bids_.begin(); it != bids_.end() && rest > 0;) {
                     auto &[price, fifo] = it->second;
@@ -89,7 +96,7 @@ namespace trading {
                                 order.side,
                                 fifo.front().price,
                                 fifo.front().quantity,
-                                now_us()
+                                now_ns()
                             };
                             trades.push_back(tr);
                             index_.erase(fifo.front().id);
@@ -103,7 +110,7 @@ namespace trading {
                                 order.side,
                                 fifo.front().price,
                                 rest,
-                                now_us()
+                                now_ns()
                             };
                             trades.push_back(tr);
                             rest = 0;
@@ -114,30 +121,31 @@ namespace trading {
                             break;
                         }
                     }
+
                     if (fifo.empty()) {
                         it = bids_.erase(it);
                     } else {
                         ++it;
                     }
+
                     if (rest == 0) {
                         return trades;
                     }
-
                 }
             }
+
             auto [lvlIt, _] = asks_.try_emplace(order.price, PriceLevel{order.price});
-            lvlIt->second.fifo.emplace_back(order.id, Side::Ask, order.price, rest, order.timestamp);
+            lvlIt->second.fifo.emplace_back(Order{order.id, Side::Ask, order.price, rest, order.timestamp});
             const auto &fifo = lvlIt->second.fifo;
             const std::size_t offset = fifo.size() - 1;
-            index_[order.id] = {order.side, order.price, offset};
-
+            index_[order.id] = {order.side, rest, order.price, offset};
         }
+
         return trades;
     }
 
-
     template<class Tree>
-    auto OrderBook::level(Tree &tree, double price)
+    auto OrderBook::level(Tree &tree, price4_t price)
         -> decltype(tree.find(price)) {
         return tree.find(price);
     }
@@ -147,7 +155,7 @@ namespace trading {
                                      typename Tree::iterator level_it,
                                      std::size_t pos) {
         auto &fifo = level_it->second.fifo;
-        fifo.erase(fifo.begin() + pos);
+        fifo.erase(fifo.begin() + static_cast<std::ptrdiff_t>(pos));
 
         for (std::size_t i = pos; i < fifo.size(); ++i)
             index_[fifo[i].id].index_in_level = i;
@@ -156,7 +164,6 @@ namespace trading {
             tree.erase(level_it);
     }
 
-
     bool OrderBook::cancel_order(std::uint64_t order_id) {
         auto idx = index_.find(order_id);
         if (idx == index_.end()) {
@@ -164,9 +171,8 @@ namespace trading {
         }
 
         const Side side = idx->second.side;
-        const double price_key = idx->second.price;
+        const price4_t price_key = idx->second.price;
         std::size_t pos = idx->second.index_in_level;
-
 
         if (side == Side::Bid) {
             erase_from_level(bids_, level(bids_, price_key), pos);
@@ -179,19 +185,17 @@ namespace trading {
     }
 
     bool OrderBook::modify_order(std::uint64_t order_id,
-                                 std::optional<double> new_price,
-                                 std::optional<std::uint32_t> new_qty) {
-
+                                 std::optional<price4_t> new_price,
+                                 std::optional<qty_t> new_qty) {
         auto idx = index_.find(order_id);
         if (idx == index_.end())
             return false;
 
         const Side side = idx->second.side;
-        const double price_key = idx->second.price;
+        const price4_t price_key = idx->second.price;
         std::size_t pos = idx->second.index_in_level;
 
-        auto modify_impl = [&](auto &tree) -> bool
-        {
+        auto modify_impl = [&](auto &tree) -> bool {
             auto levelIt = level(tree, price_key);
             if (levelIt == tree.end())
                 return false;
@@ -199,14 +203,15 @@ namespace trading {
             auto &fifo = levelIt->second.fifo;
             Order &ord = fifo[pos];
 
-            double px = new_price ? *new_price : ord.price;
-            std::uint32_t qty = new_qty ? *new_qty : ord.quantity;
+            price4_t px = new_price ? *new_price : ord.price;
+            qty_t qty = new_qty ? *new_qty : ord.quantity;
 
             if (qty == 0)
                 return cancel_order(order_id);
 
             if (px == ord.price) {
                 ord.quantity = qty;
+                idx->second.quantity = qty;
                 return true;
             }
 
@@ -216,17 +221,34 @@ namespace trading {
 
             moved.price = px;
             moved.quantity = qty;
-            moved.timestamp = now_us();
+            moved.timestamp = now_ns();
 
             add_order(moved);
             return true;
         };
 
-        //dispatch to the correct tree (no type clash)
+        // dispatch to the correct tree (no type clash)
         return (side == Side::Bid)
                    ? modify_impl(bids_)
                    : modify_impl(asks_);
     }
+
+    bool OrderBook::decrease_qty(order_id_t order_id, qty_t delta) {
+        auto idx = index_.find(order_id);
+        if (idx == index_.end())
+            return false;
+
+        return modify_order(order_id, idx->second.price, idx->second.quantity - delta);
+    }
+
+    std::optional<Side> OrderBook::side_of(order_id_t order_id) const {
+        auto idx = index_.find(order_id);
+        if (idx == index_.end())
+            return std::nullopt;
+
+        return idx->second.side;
+    }
+
 
     std::optional<Order> OrderBook::best_bid() const {
         if (bids_.empty())
@@ -244,18 +266,20 @@ namespace trading {
         return level.fifo.front();
     }
 
-    std::vector<Order> OrderBook::depth(Side side, std::size_t levels) const {
+    std::vector<std::pair<price4_t, qty_t>> OrderBook::depth(Side side, std::size_t levels) const {
+        auto fill_orders = [&levels](const auto &tree) -> std::vector<std::pair<price4_t, qty_t> > {
+            std::vector<std::pair<price4_t, qty_t>> orders;
+            if (levels == 0) return orders;
 
-        auto fill_orders = [&levels](auto &tree) -> std::vector<Order> {
-            std::vector<Order> orders;
-            if (levels == 0) {
-                return orders;
-            }
             for (auto it = tree.cbegin(); it != tree.cend() && levels--; ++it) {
+                const price4_t price = it->first;
                 const auto &fifo = it->second.fifo;
-                for (const auto &order: fifo) {
-                    orders.push_back(order);
-                }
+                int total_qty = std::accumulate(
+                    fifo.begin(), fifo.end(), 0,
+                    [](qty_t acc, const Order &order) {
+                        return acc + order.quantity;
+                    });
+                orders.insert(orders.end(), std::make_pair(price, total_qty));
             }
             return orders;
         };
